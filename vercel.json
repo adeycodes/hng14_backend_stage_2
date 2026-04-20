@@ -1,7 +1,7 @@
 {
   "functions": {
     "api/index.go": {
-      "runtime": "go1.26"
+      "runtime": "@vercel/go"
     }
   },
   "rewrites": [
