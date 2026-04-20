@@ -849,11 +849,12 @@ func handleListWithFilters(w http.ResponseWriter, r *http.Request) {
 
 	query += fmt.Sprintf(" ORDER BY %s %s", sortBy, order)
 
-	// Get total count
-	countQuery := strings.Replace(query, "SELECT id, name, gender, age, age_group, country_id", "SELECT COUNT(*)", 1)
+	// ==================== FIXED COUNT QUERY ====================
+	countQuery := `SELECT COUNT(*) FROM (` + query + `) AS subquery`
 	var total int
 	err = db.QueryRow(countQuery, args...).Scan(&total)
 	if err != nil {
+		fmt.Printf("Count query failed: %v\nQuery was: %s\n", err, query)
 		errJSON(w, http.StatusInternalServerError, "Database count failed")
 		return
 	}
@@ -947,11 +948,12 @@ func handleNaturalSearch(w http.ResponseWriter, r *http.Request) {
 
 	sqlQuery += fmt.Sprintf(" ORDER BY %s %s", sortBy, order)
 
-	// Get total count
-	countQuery := strings.Replace(sqlQuery, "SELECT id, name, gender, age, age_group, country_id", "SELECT COUNT(*)", 1)
+	// ==================== FIXED COUNT QUERY ====================
+	countQuery := `SELECT COUNT(*) FROM (` + sqlQuery + `) AS subquery`
 	var total int
 	err = db.QueryRow(countQuery, args...).Scan(&total)
 	if err != nil {
+		fmt.Printf("Natural search count failed: %v\nQuery was: %s\n", err, sqlQuery)
 		errJSON(w, http.StatusInternalServerError, "Database count failed")
 		return
 	}
