@@ -1,4 +1,4 @@
-module github.com/user/hng_stage_1
+module github.com/user/hng_stage_2
 
 go 1.26.1
 
