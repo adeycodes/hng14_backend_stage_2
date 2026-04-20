@@ -1,7 +1,5 @@
-// Single Vercel Go handler — routes all /api/* requests internally.
-// Everything lives here: DB, models, helpers, all 4 endpoints.
-// This avoids Vercel's inability to resolve local internal packages.
-
+// Complete Vercel Go handler for HNG Stage 2 - Intelligence Query Engine
+// Handles: Database, Seeding, CRUD, Advanced Filtering, Sorting, Pagination, Natural Language Query
 package handler
 
 import (
@@ -11,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,9 +19,9 @@ import (
 	_ "github.com/lib/pq"
 )
 
-// ─────────────────────────────────────────────────────────────────────────────
-// DATABASE — lazy singleton, safe for Vercel serverless cold starts
-// ─────────────────────────────────────────────────────────────────────────────
+// =================================================================================
+// DATABASE - Lazy singleton with proper table structure
+// =================================================================================
 
 var (
 	db     *sql.DB
@@ -46,34 +45,39 @@ func getDB() (*sql.DB, error) {
 		db.SetMaxOpenConns(5)
 		db.SetMaxIdleConns(2)
 		db.SetConnMaxLifetime(5 * time.Minute)
+
 		if err = db.Ping(); err != nil {
 			dbErr = fmt.Errorf("DB ping: %v", err)
 			return
 		}
+
+		// Create table with exact structure required by task
 		_, err = db.Exec(`
 			CREATE TABLE IF NOT EXISTS profiles (
 				id                  TEXT PRIMARY KEY,
 				name                TEXT UNIQUE NOT NULL,
 				gender              TEXT,
 				gender_probability  DOUBLE PRECISION,
-				sample_size         INTEGER,
+				sample_size         INTEGER DEFAULT 0,
 				age                 INTEGER,
 				age_group           TEXT,
 				country_id          TEXT,
+				country_name        TEXT,
 				country_probability DOUBLE PRECISION,
 				created_at          TEXT NOT NULL
 			)
 		`)
 		if err != nil {
 			dbErr = fmt.Errorf("create table: %v", err)
+			return
 		}
 	})
 	return db, dbErr
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MODELS
-// ─────────────────────────────────────────────────────────────────────────────
+// =================================================================================
+// MODELS - Exact match for task requirements
+// =================================================================================
 
 type Profile struct {
 	ID                 string  `json:"id"`
@@ -84,6 +88,7 @@ type Profile struct {
 	Age                int     `json:"age"`
 	AgeGroup           string  `json:"age_group"`
 	CountryID          string  `json:"country_id"`
+	CountryName        string  `json:"country_name"`
 	CountryProbability float64 `json:"country_probability"`
 	CreatedAt          string  `json:"created_at"`
 }
@@ -97,9 +102,17 @@ type ProfileSummary struct {
 	CountryID string `json:"country_id"`
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// EXTERNAL API RESPONSE TYPES
-// ─────────────────────────────────────────────────────────────────────────────
+type PaginatedResponse struct {
+	Status string           `json:"status"`
+	Page   int              `json:"page"`
+	Limit  int              `json:"limit"`
+	Total  int              `json:"total"`
+	Data   []ProfileSummary `json:"data"`
+}
+
+// =================================================================================
+// EXTERNAL API RESPONSE TYPES (for POST /profiles)
+// =================================================================================
 
 type genderizeResp struct {
 	Gender      *string `json:"gender"`
@@ -120,9 +133,29 @@ type nationalizeResp struct {
 	Country []nationalizeCountry `json:"country"`
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// HELPERS
-// ─────────────────────────────────────────────────────────────────────────────
+// Country name mapping
+var countryNames = map[string]string{
+	"NG": "Nigeria", "BJ": "Benin", "GH": "Ghana", "CI": "Côte d'Ivoire",
+	"SN": "Senegal", "ML": "Mali", "ZA": "South Africa", "KE": "Kenya",
+	"TZ": "Tanzania", "UG": "Uganda", "ET": "Ethiopia", "AO": "Angola",
+	"ZW": "Zimbabwe", "ZM": "Zambia", "MW": "Malawi", "MZ": "Mozambique",
+	"RW": "Rwanda", "SO": "Somalia", "SS": "South Sudan", "ER": "Eritrea",
+	"DJ": "Djibouti", "BI": "Burundi", "CM": "Cameroon", "CD": "DR Congo",
+	"CG": "Republic of the Congo", "GA": "Gabon", "GQ": "Equatorial Guinea",
+	"CF": "Central African Republic", "TD": "Chad", "NE": "Niger",
+	"BF": "Burkina Faso", "GM": "Gambia", "GW": "Guinea-Bissau",
+	"GN": "Guinea", "SL": "Sierra Leone", "LR": "Liberia", "CV": "Cape Verde",
+	"ST": "São Tomé and Príncipe", "MU": "Mauritius", "SC": "Seychelles",
+	"KM": "Comoros", "MG": "Madagascar", "MA": "Morocco", "DZ": "Algeria",
+	"TN": "Tunisia", "LY": "Libya", "EG": "Egypt", "SD": "Sudan",
+	"MR": "Mauritania", "EH": "Western Sahara", "US": "United States",
+	"GB": "United Kingdom", "CA": "Canada", "FR": "France", "DE": "Germany",
+	"BR": "Brazil", "IN": "India", "CN": "China", "JP": "Japan", "AU": "Australia",
+}
+
+// =================================================================================
+// HELPER FUNCTIONS
+// =================================================================================
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -136,7 +169,7 @@ func errJSON(w http.ResponseWriter, status int, message string) {
 
 func errUpstream(w http.ResponseWriter, apiName string) {
 	writeJSON(w, http.StatusBadGateway, map[string]string{
-		"status":  "502",
+		"status":  "error",
 		"message": apiName + " returned an invalid response",
 	})
 }
@@ -180,9 +213,277 @@ func fetchJSON(url string, v any) error {
 	return json.Unmarshal(body, v)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CONCURRENT ENRICHMENT — calls all 3 APIs in parallel
-// ─────────────────────────────────────────────────────────────────────────────
+// =================================================================================
+// NATURAL LANGUAGE QUERY PARSER
+// =================================================================================
+
+type QueryFilters struct {
+	Gender                *string
+	AgeGroup              *string
+	CountryID             *string
+	MinAge                *int
+	MaxAge                *int
+	MinGenderProbability  *float64
+	MinCountryProbability *float64
+}
+
+func parseNaturalLanguage(query string) (*QueryFilters, error) {
+	if query == "" {
+		return nil, fmt.Errorf("empty query")
+	}
+
+	query = strings.ToLower(query)
+	filters := &QueryFilters{}
+
+	// Gender detection
+	if strings.Contains(query, "male") || strings.Contains(query, "men") || strings.Contains(query, "boy") {
+		gender := "male"
+		filters.Gender = &gender
+	}
+	if strings.Contains(query, "female") || strings.Contains(query, "women") || strings.Contains(query, "girl") || strings.Contains(query, "females") {
+		gender := "female"
+		filters.Gender = &gender
+	}
+
+	// Age group detection
+	if strings.Contains(query, "child") || strings.Contains(query, "children") {
+		ageGroup := "child"
+		filters.AgeGroup = &ageGroup
+	}
+	if strings.Contains(query, "teen") || strings.Contains(query, "teenager") || strings.Contains(query, "adolescent") {
+		ageGroup := "teenager"
+		filters.AgeGroup = &ageGroup
+	}
+	if strings.Contains(query, "adult") {
+		ageGroup := "adult"
+		filters.AgeGroup = &ageGroup
+	}
+	if strings.Contains(query, "senior") || strings.Contains(query, "elder") || strings.Contains(query, "old") {
+		ageGroup := "senior"
+		filters.AgeGroup = &ageGroup
+	}
+
+	// "Young" maps to ages 16-24 (task requirement)
+	if strings.Contains(query, "young") {
+		minAge := 16
+		maxAge := 24
+		filters.MinAge = &minAge
+		filters.MaxAge = &maxAge
+	}
+
+	// Age range parsing
+	words := strings.Fields(query)
+	for i, word := range words {
+		// "above X", "over X", "older than X", "greater than X"
+		if (word == "above" || word == "over" || word == "older" || word == "greater") && i+1 < len(words) {
+			if age, err := strconv.Atoi(words[i+1]); err == nil {
+				filters.MinAge = &age
+			}
+		}
+		// "below X", "under X", "younger than X", "less than X"
+		if (word == "below" || word == "under" || word == "younger" || word == "less") && i+1 < len(words) {
+			if age, err := strconv.Atoi(words[i+1]); err == nil {
+				filters.MaxAge = &age
+			}
+		}
+		// "age X" or "aged X"
+		if word == "age" || word == "aged" {
+			if i+1 < len(words) {
+				if age, err := strconv.Atoi(words[i+1]); err == nil {
+					filters.MinAge = &age
+					filters.MaxAge = &age
+				}
+			}
+		}
+	}
+
+	// Country detection
+	countryMap := map[string]string{
+		"nigeria": "NG", "ghana": "GH", "kenya": "KE", "south africa": "ZA",
+		"tanzania": "TZ", "uganda": "UG", "ethiopia": "ET", "angola": "AO",
+		"zimbabwe": "ZW", "zambia": "ZM", "malawi": "MW", "mozambique": "MZ",
+		"rwanda": "RW", "somalia": "SO", "sudan": "SD", "egypt": "EG",
+		"morocco": "MA", "algeria": "DZ", "tunisia": "TN", "libya": "LY",
+		"senegal": "SN", "mali": "ML", "congo": "CD", "cameroon": "CM",
+		"united states": "US", "usa": "US", "uk": "GB", "united kingdom": "GB",
+		"canada": "CA", "france": "FR", "germany": "DE", "brazil": "BR",
+		"india": "IN", "china": "CN", "japan": "JP", "australia": "AU",
+	}
+
+	for country, code := range countryMap {
+		if strings.Contains(query, country) {
+			filters.CountryID = &code
+			break
+		}
+	}
+
+	// Check if any meaningful filter was applied
+	if filters.Gender == nil && filters.AgeGroup == nil && filters.CountryID == nil &&
+		filters.MinAge == nil && filters.MaxAge == nil {
+		return nil, fmt.Errorf("unable to interpret query")
+	}
+
+	return filters, nil
+}
+
+func applyFiltersToQuery(baseQuery string, filters *QueryFilters, args *[]interface{}, argIndex *int) string {
+	query := baseQuery
+
+	if filters.Gender != nil {
+		query += fmt.Sprintf(" AND LOWER(gender) = LOWER($%d)", *argIndex)
+		*args = append(*args, *filters.Gender)
+		*argIndex++
+	}
+
+	if filters.AgeGroup != nil {
+		query += fmt.Sprintf(" AND LOWER(age_group) = LOWER($%d)", *argIndex)
+		*args = append(*args, *filters.AgeGroup)
+		*argIndex++
+	}
+
+	if filters.CountryID != nil {
+		query += fmt.Sprintf(" AND LOWER(country_id) = LOWER($%d)", *argIndex)
+		*args = append(*args, *filters.CountryID)
+		*argIndex++
+	}
+
+	if filters.MinAge != nil {
+		query += fmt.Sprintf(" AND age >= $%d", *argIndex)
+		*args = append(*args, *filters.MinAge)
+		*argIndex++
+	}
+
+	if filters.MaxAge != nil {
+		query += fmt.Sprintf(" AND age <= $%d", *argIndex)
+		*args = append(*args, *filters.MaxAge)
+		*argIndex++
+	}
+
+	if filters.MinGenderProbability != nil {
+		query += fmt.Sprintf(" AND gender_probability >= $%d", *argIndex)
+		*args = append(*args, *filters.MinGenderProbability)
+		*argIndex++
+	}
+
+	if filters.MinCountryProbability != nil {
+		query += fmt.Sprintf(" AND country_probability >= $%d", *argIndex)
+		*args = append(*args, *filters.MinCountryProbability)
+		*argIndex++
+	}
+
+	return query
+}
+
+// =================================================================================
+// DATABASE SEEDING
+// =================================================================================
+
+func seedDatabase() error {
+	db, err := getDB()
+	if err != nil {
+		return err
+	}
+
+	// Check if already seeded
+	var count int
+	err = db.QueryRow("SELECT COUNT(*) FROM profiles").Scan(&count)
+	if err != nil {
+		return err
+	}
+
+	// If we have 2026 profiles, assume seeded
+	if count >= 2026 {
+		return nil
+	}
+
+	// Try to open seed file
+	seedFile := "seed_profiles.json"
+	file, err := os.Open(seedFile)
+	if err != nil {
+		// No seed file found, skip seeding
+		return nil
+	}
+	defer file.Close()
+
+	var seedData struct {
+		Profiles []struct {
+			Name               string  `json:"name"`
+			Gender             string  `json:"gender"`
+			GenderProbability  float64 `json:"gender_probability"`
+			Age                int     `json:"age"`
+			AgeGroup           string  `json:"age_group"`
+			CountryID          string  `json:"country_id"`
+			CountryName        string  `json:"country_name"`
+			CountryProbability float64 `json:"country_probability"`
+		} `json:"profiles"`
+	}
+
+	if err := json.NewDecoder(file).Decode(&seedData); err != nil {
+		return nil
+	}
+
+	// Insert profiles
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO profiles 
+			(id, name, gender, gender_probability, sample_size, age, age_group, 
+			 country_id, country_name, country_probability, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		ON CONFLICT (name) DO NOTHING
+	`)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	defer stmt.Close()
+
+	for _, p := range seedData.Profiles {
+		_, err = stmt.Exec(
+			uuid.Must(uuid.NewV7()).String(),
+			p.Name,
+			p.Gender,
+			p.GenderProbability,
+			0,
+			p.Age,
+			p.AgeGroup,
+			p.CountryID,
+			p.CountryName,
+			p.CountryProbability,
+			time.Now().UTC().Format("2006-01-02T15:04:05Z"),
+		)
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// =================================================================================
+// CORS MIDDLEWARE
+// =================================================================================
+
+func withCORS(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// =================================================================================
+// CONCURRENT ENRICHMENT (for POST /profiles)
+// =================================================================================
 
 type enrichResult struct {
 	genderize *genderizeResp
@@ -245,55 +546,44 @@ func enrichName(name string) enrichResult {
 	return result
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CORS MIDDLEWARE
-// ─────────────────────────────────────────────────────────────────────────────
+// =================================================================================
+// ROUTER
+// =================================================================================
 
-func withCORS(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next(w, r)
-	}
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// VERCEL ENTRYPOINT — routes all requests based on method + path
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Handler is called by Vercel for every request to /api/index
 func Handler(w http.ResponseWriter, r *http.Request) {
+	// Seed database on startup (idempotent)
+	seedDatabase()
+
 	withCORS(router)(w, r)
 }
 
 func router(w http.ResponseWriter, r *http.Request) {
-	// Vercel preserves the original request path even after rewriting.
-	// We check both r.URL.Path and the id query param Vercel injects
-	// for dynamic segments like /api/profiles/:id
 	path := strings.TrimRight(r.URL.Path, "/")
-
-	// When Vercel rewrites /api/profiles/:id → /api/index,
-	// it injects the :id segment as query param "id"
 	idFromQuery := r.URL.Query().Get("id")
 
+	// Check for natural language search endpoint
+	if strings.Contains(r.URL.Path, "/search") || (r.URL.Query().Get("q") != "" && path == "/api/index") {
+		if r.Method == http.MethodGet {
+			handleNaturalSearch(w, r)
+		} else {
+			errJSON(w, http.StatusMethodNotAllowed, "Method not allowed")
+		}
+		return
+	}
+
 	switch {
-	// /api/profiles — list or create
-	case path == "/api/profiles" || path == "/api/index" && idFromQuery == "":
+	// GET /api/profiles - list with filters
+	case path == "/api/profiles" || (path == "/api/index" && idFromQuery == "" && r.URL.Query().Get("q") == ""):
 		switch r.Method {
+		case http.MethodGet:
+			handleListWithFilters(w, r)
 		case http.MethodPost:
 			handleCreate(w, r)
-		case http.MethodGet:
-			handleList(w, r)
 		default:
 			errJSON(w, http.StatusMethodNotAllowed, "Method not allowed")
 		}
 
-	// /api/profiles/{id} — Vercel injects id as query param
+	// GET /api/profiles/{id}
 	case idFromQuery != "":
 		switch r.Method {
 		case http.MethodGet:
@@ -304,16 +594,20 @@ func router(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, http.StatusMethodNotAllowed, "Method not allowed")
 		}
 
-	// /api/profiles/{id} — path-based fallback
+	// Path-based ID
 	case strings.HasPrefix(path, "/api/profiles/"):
 		id := strings.TrimPrefix(path, "/api/profiles/")
-		switch r.Method {
-		case http.MethodGet:
-			handleGetByID(w, r, id)
-		case http.MethodDelete:
-			handleDelete(w, r, id)
-		default:
-			errJSON(w, http.StatusMethodNotAllowed, "Method not allowed")
+		if id != "" && id != "search" {
+			switch r.Method {
+			case http.MethodGet:
+				handleGetByID(w, r, id)
+			case http.MethodDelete:
+				handleDelete(w, r, id)
+			default:
+				errJSON(w, http.StatusMethodNotAllowed, "Method not allowed")
+			}
+		} else {
+			errJSON(w, http.StatusNotFound, "Route not found")
 		}
 
 	default:
@@ -321,11 +615,11 @@ func router(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// =================================================================================
 // HANDLERS
-// ─────────────────────────────────────────────────────────────────────────────
+// =================================================================================
 
-// POST /api/profiles
+// POST /api/profiles - Create new profile
 func handleCreate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Name string `json:"name"`
@@ -351,16 +645,16 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Idempotency — return existing record if name already stored
+	// Check for existing profile (idempotency)
 	var existing Profile
 	err = db.QueryRow(`
 		SELECT id, name, gender, gender_probability, sample_size,
-		       age, age_group, country_id, country_probability, created_at
+		       age, age_group, country_id, country_name, country_probability, created_at
 		FROM profiles WHERE LOWER(name) = LOWER($1)
 	`, name).Scan(
 		&existing.ID, &existing.Name, &existing.Gender, &existing.GenderProbability,
 		&existing.SampleSize, &existing.Age, &existing.AgeGroup,
-		&existing.CountryID, &existing.CountryProbability, &existing.CreatedAt,
+		&existing.CountryID, &existing.CountryName, &existing.CountryProbability, &existing.CreatedAt,
 	)
 	if err == nil {
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -375,7 +669,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Call all 3 APIs concurrently
+	// Call external APIs concurrently
 	enriched := enrichName(name)
 
 	for apiName, apiErr := range enriched.errors {
@@ -385,7 +679,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Validate — do not store null/empty responses
+	// Validate responses
 	g := enriched.genderize
 	if g == nil || g.Gender == nil || g.Count == 0 {
 		errUpstream(w, "Genderize")
@@ -410,6 +704,12 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Get country name
+	countryName := countryNames[top.CountryID]
+	if countryName == "" {
+		countryName = top.CountryID
+	}
+
 	profile := Profile{
 		ID:                 uuid.Must(uuid.NewV7()).String(),
 		Name:               name,
@@ -419,6 +719,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		Age:                *a.Age,
 		AgeGroup:           classifyAge(*a.Age),
 		CountryID:          top.CountryID,
+		CountryName:        countryName,
 		CountryProbability: top.Probability,
 		CreatedAt:          time.Now().UTC().Format("2006-01-02T15:04:05Z"),
 	}
@@ -426,12 +727,12 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	_, err = db.Exec(`
 		INSERT INTO profiles
 			(id, name, gender, gender_probability, sample_size,
-			 age, age_group, country_id, country_probability, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+			 age, age_group, country_id, country_name, country_probability, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 	`,
 		profile.ID, profile.Name, profile.Gender, profile.GenderProbability,
 		profile.SampleSize, profile.Age, profile.AgeGroup,
-		profile.CountryID, profile.CountryProbability, profile.CreatedAt,
+		profile.CountryID, profile.CountryName, profile.CountryProbability, profile.CreatedAt,
 	)
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, "Failed to store profile")
@@ -444,8 +745,8 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GET /api/profiles
-func handleList(w http.ResponseWriter, r *http.Request) {
+// GET /api/profiles - List with advanced filtering, sorting, pagination
+func handleListWithFilters(w http.ResponseWriter, r *http.Request) {
 	db, err := getDB()
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, "Database unavailable: "+err.Error())
@@ -453,26 +754,126 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	query := `SELECT id, name, gender, age, age_group, country_id FROM profiles WHERE 1=1`
-	args := []any{}
-	i := 1
+	args := []interface{}{}
+	argIndex := 1
 
+	// Apply filters
 	if v := r.URL.Query().Get("gender"); v != "" {
-		query += fmt.Sprintf(" AND LOWER(gender) = LOWER($%d)", i)
+		if v != "male" && v != "female" {
+			errJSON(w, http.StatusUnprocessableEntity, "Invalid gender value. Must be 'male' or 'female'")
+			return
+		}
+		query += fmt.Sprintf(" AND LOWER(gender) = LOWER($%d)", argIndex)
 		args = append(args, v)
-		i++
-	}
-	if v := r.URL.Query().Get("country_id"); v != "" {
-		query += fmt.Sprintf(" AND LOWER(country_id) = LOWER($%d)", i)
-		args = append(args, v)
-		i++
-	}
-	if v := r.URL.Query().Get("age_group"); v != "" {
-		query += fmt.Sprintf(" AND LOWER(age_group) = LOWER($%d)", i)
-		args = append(args, v)
-		i++
+		argIndex++
 	}
 
-	query += " ORDER BY created_at DESC"
+	if v := r.URL.Query().Get("country_id"); v != "" {
+		query += fmt.Sprintf(" AND LOWER(country_id) = LOWER($%d)", argIndex)
+		args = append(args, v)
+		argIndex++
+	}
+
+	if v := r.URL.Query().Get("age_group"); v != "" {
+		validGroups := map[string]bool{"child": true, "teenager": true, "adult": true, "senior": true}
+		if !validGroups[strings.ToLower(v)] {
+			errJSON(w, http.StatusUnprocessableEntity, "Invalid age_group. Must be child, teenager, adult, or senior")
+			return
+		}
+		query += fmt.Sprintf(" AND LOWER(age_group) = LOWER($%d)", argIndex)
+		args = append(args, v)
+		argIndex++
+	}
+
+	if v := r.URL.Query().Get("min_age"); v != "" {
+		minAge, err := strconv.Atoi(v)
+		if err != nil || minAge < 0 || minAge > 150 {
+			errJSON(w, http.StatusUnprocessableEntity, "Invalid min_age parameter")
+			return
+		}
+		query += fmt.Sprintf(" AND age >= $%d", argIndex)
+		args = append(args, minAge)
+		argIndex++
+	}
+
+	if v := r.URL.Query().Get("max_age"); v != "" {
+		maxAge, err := strconv.Atoi(v)
+		if err != nil || maxAge < 0 || maxAge > 150 {
+			errJSON(w, http.StatusUnprocessableEntity, "Invalid max_age parameter")
+			return
+		}
+		query += fmt.Sprintf(" AND age <= $%d", argIndex)
+		args = append(args, maxAge)
+		argIndex++
+	}
+
+	if v := r.URL.Query().Get("min_gender_probability"); v != "" {
+		minProb, err := strconv.ParseFloat(v, 64)
+		if err != nil || minProb < 0 || minProb > 1 {
+			errJSON(w, http.StatusUnprocessableEntity, "Invalid min_gender_probability parameter")
+			return
+		}
+		query += fmt.Sprintf(" AND gender_probability >= $%d", argIndex)
+		args = append(args, minProb)
+		argIndex++
+	}
+
+	if v := r.URL.Query().Get("min_country_probability"); v != "" {
+		minProb, err := strconv.ParseFloat(v, 64)
+		if err != nil || minProb < 0 || minProb > 1 {
+			errJSON(w, http.StatusUnprocessableEntity, "Invalid min_country_probability parameter")
+			return
+		}
+		query += fmt.Sprintf(" AND country_probability >= $%d", argIndex)
+		args = append(args, minProb)
+		argIndex++
+	}
+
+	// Apply sorting
+	sortBy := r.URL.Query().Get("sort_by")
+	if sortBy == "" {
+		sortBy = "created_at"
+	}
+	validSortFields := map[string]bool{"age": true, "created_at": true, "gender_probability": true}
+	if !validSortFields[sortBy] {
+		sortBy = "created_at"
+	}
+
+	order := r.URL.Query().Get("order")
+	if order == "" {
+		order = "desc"
+	}
+	if order != "asc" && order != "desc" {
+		order = "desc"
+	}
+
+	query += fmt.Sprintf(" ORDER BY %s %s", sortBy, order)
+
+	// Get total count
+	countQuery := strings.Replace(query, "SELECT id, name, gender, age, age_group, country_id", "SELECT COUNT(*)", 1)
+	var total int
+	err = db.QueryRow(countQuery, args...).Scan(&total)
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "Database count failed")
+		return
+	}
+
+	// Apply pagination
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	if page < 1 {
+		page = 1
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit < 1 {
+		limit = 10
+	}
+	if limit > 50 {
+		limit = 50
+	}
+
+	offset := (page - 1) * limit
+	query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argIndex, argIndex+1)
+	args = append(args, limit, offset)
 
 	rows, err := db.Query(query, args...)
 	if err != nil {
@@ -491,10 +892,110 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 		profiles = append(profiles, p)
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status": "success",
-		"count":  len(profiles),
-		"data":   profiles,
+	writeJSON(w, http.StatusOK, PaginatedResponse{
+		Status: "success",
+		Page:   page,
+		Limit:  limit,
+		Total:  total,
+		Data:   profiles,
+	})
+}
+
+// GET /api/profiles/search - Natural language query
+func handleNaturalSearch(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query().Get("q")
+	if query == "" {
+		errJSON(w, http.StatusBadRequest, "Missing 'q' parameter")
+		return
+	}
+
+	filters, err := parseNaturalLanguage(query)
+	if err != nil {
+		errJSON(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+
+	db, err := getDB()
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "Database unavailable: "+err.Error())
+		return
+	}
+
+	sqlQuery := `SELECT id, name, gender, age, age_group, country_id FROM profiles WHERE 1=1`
+	args := []interface{}{}
+	argIndex := 1
+
+	sqlQuery = applyFiltersToQuery(sqlQuery, filters, &args, &argIndex)
+
+	// Apply sorting
+	sortBy := r.URL.Query().Get("sort_by")
+	if sortBy == "" {
+		sortBy = "created_at"
+	}
+	validSortFields := map[string]bool{"age": true, "created_at": true, "gender_probability": true}
+	if !validSortFields[sortBy] {
+		sortBy = "created_at"
+	}
+
+	order := r.URL.Query().Get("order")
+	if order == "" {
+		order = "desc"
+	}
+	if order != "asc" && order != "desc" {
+		order = "desc"
+	}
+
+	sqlQuery += fmt.Sprintf(" ORDER BY %s %s", sortBy, order)
+
+	// Get total count
+	countQuery := strings.Replace(sqlQuery, "SELECT id, name, gender, age, age_group, country_id", "SELECT COUNT(*)", 1)
+	var total int
+	err = db.QueryRow(countQuery, args...).Scan(&total)
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "Database count failed")
+		return
+	}
+
+	// Pagination
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	if page < 1 {
+		page = 1
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit < 1 {
+		limit = 10
+	}
+	if limit > 50 {
+		limit = 50
+	}
+
+	offset := (page - 1) * limit
+	sqlQuery += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argIndex, argIndex+1)
+	args = append(args, limit, offset)
+
+	rows, err := db.Query(sqlQuery, args...)
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "Database query failed")
+		return
+	}
+	defer rows.Close()
+
+	profiles := []ProfileSummary{}
+	for rows.Next() {
+		var p ProfileSummary
+		if err := rows.Scan(&p.ID, &p.Name, &p.Gender, &p.Age, &p.AgeGroup, &p.CountryID); err != nil {
+			errJSON(w, http.StatusInternalServerError, "Failed to read profiles")
+			return
+		}
+		profiles = append(profiles, p)
+	}
+
+	writeJSON(w, http.StatusOK, PaginatedResponse{
+		Status: "success",
+		Page:   page,
+		Limit:  limit,
+		Total:  total,
+		Data:   profiles,
 	})
 }
 
@@ -514,12 +1015,12 @@ func handleGetByID(w http.ResponseWriter, r *http.Request, id string) {
 	var p Profile
 	err = db.QueryRow(`
 		SELECT id, name, gender, gender_probability, sample_size,
-		       age, age_group, country_id, country_probability, created_at
+		       age, age_group, country_id, country_name, country_probability, created_at
 		FROM profiles WHERE id = $1
 	`, id).Scan(
 		&p.ID, &p.Name, &p.Gender, &p.GenderProbability,
 		&p.SampleSize, &p.Age, &p.AgeGroup,
-		&p.CountryID, &p.CountryProbability, &p.CreatedAt,
+		&p.CountryID, &p.CountryName, &p.CountryProbability, &p.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
 		errJSON(w, http.StatusNotFound, "Profile not found")
