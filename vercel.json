@@ -1,9 +1,5 @@
 {
-  "functions": {
-    "api/index.go": {
-      "runtime": "go1.x"
-    }
-  },
+  
   "rewrites": [
     {
       "source": "/api/(.*)",
