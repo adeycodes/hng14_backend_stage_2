@@ -1,5 +1,4 @@
 // Complete Vercel Go handler for HNG Stage 2 - Intelligence Query Engine
-// Fixes: Schema sync, Response Structure, NLP Parsing, Seeding Logic
 package handler
 
 import (
@@ -404,38 +403,61 @@ func seedDatabase() error {
 		return err
 	}
 
-	// Only seed if empty
 	var count int
 	err = db.QueryRow("SELECT COUNT(*) FROM profiles").Scan(&count)
 	if err != nil {
 		return err
 	}
-	if count > 0 {
-		return nil // Already seeded
+	if count >= 2026 {
+		return nil
 	}
 
-	seedFile := "seed_profiles.json"
-	file, err := os.Open(seedFile)
+	fmt.Println("Seeding database...")
+
+	// 1. Try to read local file first (works on your machine)
+	jsonData, err := os.ReadFile("seed_profiles.json")
+
+	// 2. If local file missing (Vercel), download from GitHub
 	if err != nil {
-		// If file missing, return error so we know (logs in Vercel)
-		return fmt.Errorf("seed file missing: %v", err)
-	}
-	defer file.Close()
+		fmt.Println("Local seed file missing, downloading from remote...")
 
-	// Try to decode as top-level array first ([]Profile)
+		// --- ACTION REQUIRED ---
+		// Replace this URL with the RAW URL to your JSON file on GitHub
+		remoteURL := "https://raw.githubusercontent.com/adeycodes/hng14_backend_stage_2/refs/heads/main/seed_profiles.json"
+
+		resp, httpErr := http.Get(remoteURL)
+		if httpErr != nil {
+			return fmt.Errorf("remote download failed: %v", httpErr)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			return fmt.Errorf("remote file status: %d", resp.StatusCode)
+		}
+
+		bodyBytes, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return readErr
+		}
+		jsonData = bodyBytes
+	}
+
+	// 3. Parse the JSON Data
 	var profiles []Profile
-	if err := json.NewDecoder(file).Decode(&profiles); err != nil {
-		// If that fails, try wrapped format {"profiles": [...]}
-		file.Seek(0, 0) // Reset file pointer
+
+	// Try parsing as Array first ([]Profile)
+	if err := json.Unmarshal(jsonData, &profiles); err != nil {
+		// If that fails, try parsing as Object ({"profiles": [...]})
 		var wrapper struct {
 			Profiles []Profile `json:"profiles"`
 		}
-		if err := json.NewDecoder(file).Decode(&wrapper); err != nil {
-			return fmt.Errorf("invalid seed JSON format: %v", err)
+		if wrapErr := json.Unmarshal(jsonData, &wrapper); wrapErr != nil {
+			return fmt.Errorf("invalid JSON format: %v", err)
 		}
 		profiles = wrapper.Profiles
 	}
 
+	// 4. Insert into Database
 	tx, err := db.Begin()
 	if err != nil {
 		return err
@@ -455,7 +477,6 @@ func seedDatabase() error {
 	defer stmt.Close()
 
 	for _, p := range profiles {
-		// Generate data if missing in seed (fallback)
 		if p.ID == "" {
 			p.ID = uuid.Must(uuid.NewV7()).String()
 		}
@@ -476,6 +497,7 @@ func seedDatabase() error {
 		}
 	}
 
+	fmt.Printf("Seeded %d profiles successfully.\n", len(profiles))
 	return tx.Commit()
 }
 
