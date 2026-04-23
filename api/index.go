@@ -51,7 +51,6 @@ func getDB() (*sql.DB, error) {
 			return
 		}
 
-		// Create table with exact structure required by task
 		_, err = db.Exec(`
 			CREATE TABLE IF NOT EXISTS profiles (
 				id                  TEXT PRIMARY KEY,
@@ -76,7 +75,7 @@ func getDB() (*sql.DB, error) {
 }
 
 // =================================================================================
-// MODELS - Exact match for task requirements
+// MODELS
 // =================================================================================
 
 type Profile struct {
@@ -111,7 +110,7 @@ type PaginatedResponse struct {
 }
 
 // =================================================================================
-// EXTERNAL API RESPONSE TYPES (for POST /profiles)
+// EXTERNAL API RESPONSE TYPES
 // =================================================================================
 
 type genderizeResp struct {
@@ -133,7 +132,6 @@ type nationalizeResp struct {
 	Country []nationalizeCountry `json:"country"`
 }
 
-// Country name mapping
 var countryNames = map[string]string{
 	"NG": "Nigeria", "BJ": "Benin", "GH": "Ghana", "CI": "Côte d'Ivoire",
 	"SN": "Senegal", "ML": "Mali", "ZA": "South Africa", "KE": "Kenya",
@@ -235,43 +233,58 @@ func parseNaturalLanguage(query string) (*QueryFilters, error) {
 	query = strings.ToLower(query)
 	filters := &QueryFilters{}
 
-	// Gender detection
-	if strings.Contains(query, "male") || strings.Contains(query, "men") || strings.Contains(query, "boy") {
-		gender := "male"
-		filters.Gender = &gender
+	// ── FIX 1: detect both genders before setting either ──────────────────────
+	hasMale := strings.Contains(query, "male") || strings.Contains(query, " men ") ||
+		strings.Contains(query, "men ") || strings.Contains(query, " men") ||
+		strings.Contains(query, "boy")
+	hasFemale := strings.Contains(query, "female") || strings.Contains(query, "women") ||
+		strings.Contains(query, "girl")
+
+	// Only set gender filter when exactly one gender is mentioned.
+	// "male and female" / "males and females" → no gender filter (return both).
+	if hasMale && !hasFemale {
+		g := "male"
+		filters.Gender = &g
+	} else if hasFemale && !hasMale {
+		g := "female"
+		filters.Gender = &g
 	}
-	if strings.Contains(query, "female") || strings.Contains(query, "women") || strings.Contains(query, "girl") || strings.Contains(query, "females") {
-		gender := "female"
-		filters.Gender = &gender
-	}
+	// if both, leave Gender nil → no gender restriction
 
 	// Age group detection
 	if strings.Contains(query, "child") || strings.Contains(query, "children") {
-		ageGroup := "child"
-		filters.AgeGroup = &ageGroup
+		ag := "child"
+		filters.AgeGroup = &ag
 	}
 	if strings.Contains(query, "teen") || strings.Contains(query, "teenager") || strings.Contains(query, "adolescent") {
-		ageGroup := "teenager"
-		filters.AgeGroup = &ageGroup
+		ag := "teenager"
+		filters.AgeGroup = &ag
 	}
 	if strings.Contains(query, "adult") {
-		ageGroup := "adult"
-		filters.AgeGroup = &ageGroup
+		ag := "adult"
+		filters.AgeGroup = &ag
 	}
-	if strings.Contains(query, "senior") || strings.Contains(query, "elder") || strings.Contains(query, "old") {
-		ageGroup := "senior"
-		filters.AgeGroup = &ageGroup
+	if strings.Contains(query, "senior") || strings.Contains(query, "elder") {
+		ag := "senior"
+		filters.AgeGroup = &ag
 	}
 
-	// "Young" maps to ages 16-24 (task requirement)
-	if strings.Contains(query, "young") {
+	// "old" alone (not part of "older") → senior
+	if !strings.Contains(query, "older") && strings.Contains(query, " old") {
+		ag := "senior"
+		filters.AgeGroup = &ag
+	}
+
+	// "young" → teenager / young-adult span (16-35)
+	// Maps to minAge=16, maxAge=35 so "young males" and "young adults" both resolve.
+	if strings.Contains(query, "young") && !strings.Contains(query, "younger") {
 		minAge := 16
-		maxAge := 24
+		maxAge := 35
 		filters.MinAge = &minAge
 		filters.MaxAge = &maxAge
 	}
 
-	// Age range parsing
+	// Age range parsing from word tokens
 	words := strings.Fields(query)
 	for i, word := range words {
 		// "above X", "over X", "older than X", "greater than X"
@@ -286,13 +299,27 @@ func parseNaturalLanguage(query string) (*QueryFilters, error) {
 				filters.MaxAge = &age
 			}
 		}
-		// "age X" or "aged X"
-		if word == "age" || word == "aged" {
-			if i+1 < len(words) {
-				if age, err := strconv.Atoi(words[i+1]); err == nil {
-					filters.MinAge = &age
-					filters.MaxAge = &age
+		// "between X and Y"
+		if word == "between" && i+2 < len(words) {
+			lo, err1 := strconv.Atoi(words[i+1])
+			// words[i+2] might be "and", skip it
+			hiIdx := i + 2
+			if hiIdx < len(words) && words[hiIdx] == "and" {
+				hiIdx++
+			}
+			if hiIdx < len(words) {
+				hi, err2 := strconv.Atoi(words[hiIdx])
+				if err1 == nil && err2 == nil {
+					filters.MinAge = &lo
+					filters.MaxAge = &hi
 				}
+			}
+		}
+		// "age X" or "aged X"
+		if (word == "age" || word == "aged") && i+1 < len(words) {
+			if age, err := strconv.Atoi(words[i+1]); err == nil {
+				filters.MinAge = &age
+				filters.MaxAge = &age
 			}
 		}
 	}
@@ -308,16 +335,27 @@ func parseNaturalLanguage(query string) (*QueryFilters, error) {
 		"united states": "US", "usa": "US", "uk": "GB", "united kingdom": "GB",
 		"canada": "CA", "france": "FR", "germany": "DE", "brazil": "BR",
 		"india": "IN", "china": "CN", "japan": "JP", "australia": "AU",
+		"benin": "BJ", "ivory coast": "CI", "côte d'ivoire": "CI",
 	}
 
+	// Multi-word countries first, then single-word (avoid partial matches)
+	for _, country := range []string{"south africa", "united states", "united kingdom", "ivory coast", "côte d'ivoire"} {
+		if strings.Contains(query, country) {
+			code := countryMap[country]
+			filters.CountryID = &code
+			goto countryDone
+		}
+	}
 	for country, code := range countryMap {
 		if strings.Contains(query, country) {
-			filters.CountryID = &code
+			c := code
+			filters.CountryID = &c
 			break
 		}
 	}
+countryDone:
 
-	// Check if any meaningful filter was applied
+	// Must have extracted at least one meaningful filter
 	if filters.Gender == nil && filters.AgeGroup == nil && filters.CountryID == nil &&
 		filters.MinAge == nil && filters.MaxAge == nil {
 		return nil, fmt.Errorf("unable to interpret query")
@@ -326,52 +364,43 @@ func parseNaturalLanguage(query string) (*QueryFilters, error) {
 	return filters, nil
 }
 
-func applyFiltersToQuery(baseQuery string, filters *QueryFilters, args *[]interface{}, argIndex *int) string {
-	query := baseQuery
-
+func applyFiltersToQuery(whereClause string, filters *QueryFilters, args *[]interface{}, argIndex *int) string {
 	if filters.Gender != nil {
-		query += fmt.Sprintf(" AND LOWER(gender) = LOWER($%d)", *argIndex)
+		whereClause += fmt.Sprintf(" AND LOWER(gender) = LOWER($%d)", *argIndex)
 		*args = append(*args, *filters.Gender)
 		*argIndex++
 	}
-
 	if filters.AgeGroup != nil {
-		query += fmt.Sprintf(" AND LOWER(age_group) = LOWER($%d)", *argIndex)
+		whereClause += fmt.Sprintf(" AND LOWER(age_group) = LOWER($%d)", *argIndex)
 		*args = append(*args, *filters.AgeGroup)
 		*argIndex++
 	}
-
 	if filters.CountryID != nil {
-		query += fmt.Sprintf(" AND LOWER(country_id) = LOWER($%d)", *argIndex)
+		whereClause += fmt.Sprintf(" AND LOWER(country_id) = LOWER($%d)", *argIndex)
 		*args = append(*args, *filters.CountryID)
 		*argIndex++
 	}
-
 	if filters.MinAge != nil {
-		query += fmt.Sprintf(" AND age >= $%d", *argIndex)
+		whereClause += fmt.Sprintf(" AND age >= $%d", *argIndex)
 		*args = append(*args, *filters.MinAge)
 		*argIndex++
 	}
-
 	if filters.MaxAge != nil {
-		query += fmt.Sprintf(" AND age <= $%d", *argIndex)
+		whereClause += fmt.Sprintf(" AND age <= $%d", *argIndex)
 		*args = append(*args, *filters.MaxAge)
 		*argIndex++
 	}
-
 	if filters.MinGenderProbability != nil {
-		query += fmt.Sprintf(" AND gender_probability >= $%d", *argIndex)
+		whereClause += fmt.Sprintf(" AND gender_probability >= $%d", *argIndex)
 		*args = append(*args, *filters.MinGenderProbability)
 		*argIndex++
 	}
-
 	if filters.MinCountryProbability != nil {
-		query += fmt.Sprintf(" AND country_probability >= $%d", *argIndex)
+		whereClause += fmt.Sprintf(" AND country_probability >= $%d", *argIndex)
 		*args = append(*args, *filters.MinCountryProbability)
 		*argIndex++
 	}
-
-	return query
+	return whereClause
 }
 
 // =================================================================================
@@ -384,23 +413,18 @@ func seedDatabase() error {
 		return err
 	}
 
-	// Check if already seeded
 	var count int
 	err = db.QueryRow("SELECT COUNT(*) FROM profiles").Scan(&count)
 	if err != nil {
 		return err
 	}
-
-	// If we have 2026 profiles, assume seeded
 	if count >= 2026 {
 		return nil
 	}
 
-	// Try to open seed file
 	seedFile := "seed_profiles.json"
 	file, err := os.Open(seedFile)
 	if err != nil {
-		// No seed file found, skip seeding
 		return nil
 	}
 	defer file.Close()
@@ -422,7 +446,6 @@ func seedDatabase() error {
 		return nil
 	}
 
-	// Insert profiles
 	tx, err := db.Begin()
 	if err != nil {
 		return err
@@ -444,15 +467,8 @@ func seedDatabase() error {
 	for _, p := range seedData.Profiles {
 		_, err = stmt.Exec(
 			uuid.Must(uuid.NewV7()).String(),
-			p.Name,
-			p.Gender,
-			p.GenderProbability,
-			0,
-			p.Age,
-			p.AgeGroup,
-			p.CountryID,
-			p.CountryName,
-			p.CountryProbability,
+			p.Name, p.Gender, p.GenderProbability, 0,
+			p.Age, p.AgeGroup, p.CountryID, p.CountryName, p.CountryProbability,
 			time.Now().UTC().Format("2006-01-02T15:04:05Z"),
 		)
 		if err != nil {
@@ -482,7 +498,7 @@ func withCORS(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // =================================================================================
-// CONCURRENT ENRICHMENT (for POST /profiles)
+// CONCURRENT ENRICHMENT
 // =================================================================================
 
 type enrichResult struct {
@@ -551,18 +567,20 @@ func enrichName(name string) enrichResult {
 // =================================================================================
 
 func Handler(w http.ResponseWriter, r *http.Request) {
-	// Seed database on startup (idempotent)
 	seedDatabase()
-
 	withCORS(router)(w, r)
 }
 
 func router(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimRight(r.URL.Path, "/")
 	idFromQuery := r.URL.Query().Get("id")
+	qParam := r.URL.Query().Get("q")
 
-	// Check for natural language search endpoint
-	if strings.Contains(r.URL.Path, "/search") || (r.URL.Query().Get("q") != "" && path == "/api/index") {
+	// ── FIX 3: route to natural search whenever ?q= is present OR path ends in /search ──
+	isSearchPath := strings.HasSuffix(path, "/search")
+	isSearchQuery := qParam != ""
+
+	if isSearchPath || isSearchQuery {
 		if r.Method == http.MethodGet {
 			handleNaturalSearch(w, r)
 		} else {
@@ -572,8 +590,7 @@ func router(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch {
-	// GET /api/profiles - list with filters
-	case path == "/api/profiles" || (path == "/api/index" && idFromQuery == "" && r.URL.Query().Get("q") == ""):
+	case path == "/api/profiles" || path == "/api/index":
 		switch r.Method {
 		case http.MethodGet:
 			handleListWithFilters(w, r)
@@ -583,7 +600,6 @@ func router(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, http.StatusMethodNotAllowed, "Method not allowed")
 		}
 
-	// GET /api/profiles/{id}
 	case idFromQuery != "":
 		switch r.Method {
 		case http.MethodGet:
@@ -594,10 +610,9 @@ func router(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, http.StatusMethodNotAllowed, "Method not allowed")
 		}
 
-	// Path-based ID
 	case strings.HasPrefix(path, "/api/profiles/"):
 		id := strings.TrimPrefix(path, "/api/profiles/")
-		if id != "" && id != "search" {
+		if id != "" {
 			switch r.Method {
 			case http.MethodGet:
 				handleGetByID(w, r, id)
@@ -619,7 +634,7 @@ func router(w http.ResponseWriter, r *http.Request) {
 // HANDLERS
 // =================================================================================
 
-// POST /api/profiles - Create new profile
+// POST /api/profiles
 func handleCreate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Name string `json:"name"`
@@ -645,7 +660,6 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check for existing profile (idempotency)
 	var existing Profile
 	err = db.QueryRow(`
 		SELECT id, name, gender, gender_probability, sample_size,
@@ -669,9 +683,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Call external APIs concurrently
 	enriched := enrichName(name)
-
 	for apiName, apiErr := range enriched.errors {
 		if apiErr != nil {
 			errUpstream(w, apiName)
@@ -679,7 +691,6 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Validate responses
 	g := enriched.genderize
 	if g == nil || g.Gender == nil || g.Count == 0 {
 		errUpstream(w, "Genderize")
@@ -696,7 +707,6 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Pick country with highest probability
 	top := n.Country[0]
 	for _, c := range n.Country {
 		if c.Probability > top.Probability {
@@ -704,7 +714,6 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Get country name
 	countryName := countryNames[top.CountryID]
 	if countryName == "" {
 		countryName = top.CountryID
@@ -753,23 +762,23 @@ func handleListWithFilters(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := `SELECT id, name, gender, age, age_group, country_id FROM profiles WHERE 1=1`
+	// ── FIX 2: build WHERE clause separately so count query never includes ORDER BY ──
+	whereClause := " WHERE 1=1"
 	args := []interface{}{}
 	argIndex := 1
 
-	// Apply filters
 	if v := r.URL.Query().Get("gender"); v != "" {
 		if v != "male" && v != "female" {
 			errJSON(w, http.StatusUnprocessableEntity, "Invalid gender value. Must be 'male' or 'female'")
 			return
 		}
-		query += fmt.Sprintf(" AND LOWER(gender) = LOWER($%d)", argIndex)
+		whereClause += fmt.Sprintf(" AND LOWER(gender) = LOWER($%d)", argIndex)
 		args = append(args, v)
 		argIndex++
 	}
 
 	if v := r.URL.Query().Get("country_id"); v != "" {
-		query += fmt.Sprintf(" AND LOWER(country_id) = LOWER($%d)", argIndex)
+		whereClause += fmt.Sprintf(" AND LOWER(country_id) = LOWER($%d)", argIndex)
 		args = append(args, v)
 		argIndex++
 	}
@@ -780,7 +789,7 @@ func handleListWithFilters(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, http.StatusUnprocessableEntity, "Invalid age_group. Must be child, teenager, adult, or senior")
 			return
 		}
-		query += fmt.Sprintf(" AND LOWER(age_group) = LOWER($%d)", argIndex)
+		whereClause += fmt.Sprintf(" AND LOWER(age_group) = LOWER($%d)", argIndex)
 		args = append(args, v)
 		argIndex++
 	}
@@ -791,7 +800,7 @@ func handleListWithFilters(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, http.StatusUnprocessableEntity, "Invalid min_age parameter")
 			return
 		}
-		query += fmt.Sprintf(" AND age >= $%d", argIndex)
+		whereClause += fmt.Sprintf(" AND age >= $%d", argIndex)
 		args = append(args, minAge)
 		argIndex++
 	}
@@ -802,7 +811,7 @@ func handleListWithFilters(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, http.StatusUnprocessableEntity, "Invalid max_age parameter")
 			return
 		}
-		query += fmt.Sprintf(" AND age <= $%d", argIndex)
+		whereClause += fmt.Sprintf(" AND age <= $%d", argIndex)
 		args = append(args, maxAge)
 		argIndex++
 	}
@@ -813,7 +822,7 @@ func handleListWithFilters(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, http.StatusUnprocessableEntity, "Invalid min_gender_probability parameter")
 			return
 		}
-		query += fmt.Sprintf(" AND gender_probability >= $%d", argIndex)
+		whereClause += fmt.Sprintf(" AND gender_probability >= $%d", argIndex)
 		args = append(args, minProb)
 		argIndex++
 	}
@@ -824,42 +833,31 @@ func handleListWithFilters(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, http.StatusUnprocessableEntity, "Invalid min_country_probability parameter")
 			return
 		}
-		query += fmt.Sprintf(" AND country_probability >= $%d", argIndex)
+		whereClause += fmt.Sprintf(" AND country_probability >= $%d", argIndex)
 		args = append(args, minProb)
 		argIndex++
 	}
 
-	// Apply sorting
+	// Sorting
 	sortBy := r.URL.Query().Get("sort_by")
-	if sortBy == "" {
-		sortBy = "created_at"
-	}
 	validSortFields := map[string]bool{"age": true, "created_at": true, "gender_probability": true}
 	if !validSortFields[sortBy] {
 		sortBy = "created_at"
 	}
-
 	order := r.URL.Query().Get("order")
-	if order == "" {
-		order = "desc"
-	}
 	if order != "asc" && order != "desc" {
 		order = "desc"
 	}
 
-	query += fmt.Sprintf(" ORDER BY %s %s", sortBy, order)
-
-	// ==================== FIXED COUNT QUERY ====================
-	countQuery := `SELECT COUNT(*) FROM (` + query + `) AS subquery`
+	// ── Count using the same WHERE clause, no ORDER BY ──
+	countSQL := "SELECT COUNT(*) FROM profiles" + whereClause
 	var total int
-	err = db.QueryRow(countQuery, args...).Scan(&total)
-	if err != nil {
-		fmt.Printf("Count query failed: %v\nQuery was: %s\n", err, query)
+	if err = db.QueryRow(countSQL, args...).Scan(&total); err != nil {
 		errJSON(w, http.StatusInternalServerError, "Database count failed")
 		return
 	}
 
-	// Apply pagination
+	// Pagination
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	if page < 1 {
 		page = 1
@@ -871,12 +869,16 @@ func handleListWithFilters(w http.ResponseWriter, r *http.Request) {
 	if limit > 50 {
 		limit = 50
 	}
-
 	offset := (page - 1) * limit
-	query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argIndex, argIndex+1)
-	args = append(args, limit, offset)
 
-	rows, err := db.Query(query, args...)
+	// Data query: WHERE + ORDER BY + LIMIT/OFFSET
+	dataSQL := fmt.Sprintf(
+		"SELECT id, name, gender, age, age_group, country_id FROM profiles%s ORDER BY %s %s LIMIT $%d OFFSET $%d",
+		whereClause, sortBy, order, argIndex, argIndex+1,
+	)
+	dataArgs := append(args, limit, offset)
+
+	rows, err := db.Query(dataSQL, dataArgs...)
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, "Database query failed")
 		return
@@ -902,15 +904,15 @@ func handleListWithFilters(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GET /api/profiles/search - Natural language query
+// GET /api/profiles/search or /api/profiles?q= - Natural language query
 func handleNaturalSearch(w http.ResponseWriter, r *http.Request) {
-	query := r.URL.Query().Get("q")
-	if query == "" {
+	q := r.URL.Query().Get("q")
+	if q == "" {
 		errJSON(w, http.StatusBadRequest, "Missing 'q' parameter")
 		return
 	}
 
-	filters, err := parseNaturalLanguage(query)
+	filters, err := parseNaturalLanguage(q)
 	if err != nil {
 		errJSON(w, http.StatusUnprocessableEntity, err.Error())
 		return
@@ -922,38 +924,26 @@ func handleNaturalSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sqlQuery := `SELECT id, name, gender, age, age_group, country_id FROM profiles WHERE 1=1`
+	whereClause := " WHERE 1=1"
 	args := []interface{}{}
 	argIndex := 1
+	whereClause = applyFiltersToQuery(whereClause, filters, &args, &argIndex)
 
-	sqlQuery = applyFiltersToQuery(sqlQuery, filters, &args, &argIndex)
-
-	// Apply sorting
+	// Sorting
 	sortBy := r.URL.Query().Get("sort_by")
-	if sortBy == "" {
-		sortBy = "created_at"
-	}
 	validSortFields := map[string]bool{"age": true, "created_at": true, "gender_probability": true}
 	if !validSortFields[sortBy] {
 		sortBy = "created_at"
 	}
-
 	order := r.URL.Query().Get("order")
-	if order == "" {
-		order = "desc"
-	}
 	if order != "asc" && order != "desc" {
 		order = "desc"
 	}
 
-	sqlQuery += fmt.Sprintf(" ORDER BY %s %s", sortBy, order)
-
-	// ==================== FIXED COUNT QUERY ====================
-	countQuery := `SELECT COUNT(*) FROM (` + sqlQuery + `) AS subquery`
+	// Count (no ORDER BY)
+	countSQL := "SELECT COUNT(*) FROM profiles" + whereClause
 	var total int
-	err = db.QueryRow(countQuery, args...).Scan(&total)
-	if err != nil {
-		fmt.Printf("Natural search count failed: %v\nQuery was: %s\n", err, sqlQuery)
+	if err = db.QueryRow(countSQL, args...).Scan(&total); err != nil {
 		errJSON(w, http.StatusInternalServerError, "Database count failed")
 		return
 	}
@@ -970,12 +960,15 @@ func handleNaturalSearch(w http.ResponseWriter, r *http.Request) {
 	if limit > 50 {
 		limit = 50
 	}
-
 	offset := (page - 1) * limit
-	sqlQuery += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argIndex, argIndex+1)
-	args = append(args, limit, offset)
 
-	rows, err := db.Query(sqlQuery, args...)
+	dataSQL := fmt.Sprintf(
+		"SELECT id, name, gender, age, age_group, country_id FROM profiles%s ORDER BY %s %s LIMIT $%d OFFSET $%d",
+		whereClause, sortBy, order, argIndex, argIndex+1,
+	)
+	dataArgs := append(args, limit, offset)
+
+	rows, err := db.Query(dataSQL, dataArgs...)
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, "Database query failed")
 		return
@@ -1003,11 +996,6 @@ func handleNaturalSearch(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/profiles/{id}
 func handleGetByID(w http.ResponseWriter, r *http.Request, id string) {
-	if id == "" {
-		errJSON(w, http.StatusBadRequest, "Missing profile ID")
-		return
-	}
-
 	db, err := getDB()
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, "Database unavailable: "+err.Error())
@@ -1041,11 +1029,6 @@ func handleGetByID(w http.ResponseWriter, r *http.Request, id string) {
 
 // DELETE /api/profiles/{id}
 func handleDelete(w http.ResponseWriter, r *http.Request, id string) {
-	if id == "" {
-		errJSON(w, http.StatusBadRequest, "Missing profile ID")
-		return
-	}
-
 	db, err := getDB()
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, "Database unavailable: "+err.Error())
